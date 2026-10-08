@@ -76,11 +76,37 @@ jobs:
         shell: pwsh
         run: |
           Set-Location goroot
+          # The tree is not a git repository (it came from a zip), but `git
+          # apply` works on a plain directory.
           git -c core.autocrlf=false apply -p1 ..\patches\go${{ env.GO_VERSION }}-ps5.patch
+          if ($LASTEXITCODE -ne 0) { throw "the Go patch did not apply" }
+          # Confirm the patch is really in the sources: it adds freebsd/amd64
+          # to the platforms allowed to use the internal linker for PIE.
+          if (-not (Select-String -Path src\internal\platform\supported.go -SimpleMatch '"freebsd/amd64"' -Quiet)) {
+            throw "the Go patch did not reach src\internal\platform\supported.go"
+          }
+          # The patch touches a package that cmd/go and cmd/link both compile
+          # in, so the tools themselves have to be rebuilt before anything
+          # else can be built.
+          #
+          # The tools that come with the release are removed first. They are
+          # stamped with a build ID and their own timestamps, and `go install`
+          # skips a target it considers up to date: with the binaries in place
+          # the rebuild silently does nothing and the unpatched tools stay,
+          # which then fails later with "-buildmode=pie requires external
+          # (cgo) linking". Deleting them forces the rebuild.
           Copy-Item bin\go.exe bin\go-bootstrap.exe
+          Remove-Item bin\go.exe
+          Remove-Item pkg\tool\windows_amd64\link.exe
           $env:GOTOOLCHAIN = 'local'
+          $env:GOFLAGS = ''
           .\bin\go-bootstrap.exe install cmd/go cmd/link
+          if ($LASTEXITCODE -ne 0) { throw "rebuilding cmd/go and cmd/link failed" }
           Set-Location ..
+          if (-not (Test-Path goroot\bin\go.exe)) { throw "cmd/go was not rebuilt" }
+          if (-not (Test-Path goroot\pkg\tool\windows_amd64\link.exe)) { throw "cmd/link was not rebuilt" }
+          .\goroot\bin\go.exe version
+          if ($LASTEXITCODE -ne 0) { throw "the rebuilt go does not run" }
 
       - name: Build the payload
         shell: pwsh
