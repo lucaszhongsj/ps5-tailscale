@@ -27,6 +27,7 @@ import (
 	"tailscale.com/client/local"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/net/netmon"
 	"tailscale.com/tsnet"
 )
 
@@ -272,8 +273,22 @@ func (d *daemon) networkChanged() {
 	if recent || lc == nil {
 		return
 	}
-	d.logf("the console's network changed; asking Tailscale to rebind")
+	d.logf("the console's network changed; waiting for network to be ready before rebind")
 	go func() {
+		// After a wake-from-rest the network takes a moment to come up.
+		// Wait for a default route to appear before asking Tailscale to
+		// rebind, to avoid flooding the console with failing connections.
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, _, ok := netmon.LikelyHomeRouterIP(); ok {
+				break
+			}
+			time.Sleep(time.Second)
+		}
+		if _, _, ok := netmon.LikelyHomeRouterIP(); !ok {
+			d.logf("network not ready, skipping rebind")
+			return
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		for _, action := range []string{"rebind", "restun"} {
