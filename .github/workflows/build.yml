@@ -1,0 +1,101 @@
+# Build the PS5 payload (tailscale.elf) and run the unit tests.
+#
+# This mirrors docs/BUILDING.md, which builds on Windows with PowerShell. The
+# three components the build needs are:
+#
+#   toolchain\llvm\bin\        clang.exe, ld.lld.exe (LLVM 20 or newer)
+#   toolchain\ps5-payload-sdk\ the ps5-payload-sdk release
+#   goroot\                    Go with patches\go1.27.1-ps5.patch applied
+#
+# The first two come from public releases. The Go tree is rebuilt on the
+# runner because the patch touches a package both `go` and `link` compile in,
+# so the tools themselves have to be rebuilt with the patched sources.
+#
+# The payload can be built from any branch. A signed release additionally
+# needs the release signing key (docs/BUILDING.md), which is not on the
+# runner; the build here signs with a throwaway key so the artifact can be
+# tested, but consoles will refuse to install it from the status page.
+
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version string embedded in the payload (e.g. 0.7.2)'
+        required: false
+        default: '0.0.0-dev'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      GO_VERSION: '1.27.1'
+      LLVM_VERSION: '23.1.2'
+      SDK_VERSION: 'v0.43'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download LLVM
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $llvm = "clang+llvm-${{ env.LLVM_VERSION }}-x86_64-pc-windows-msvc.tar.xz"
+          Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-${{ env.LLVM_VERSION }}/$llvm" -OutFile $llvm
+          New-Item -ItemType Directory -Force toolchain\llvm | Out-Null
+          tar -xf $llvm -C toolchain\llvm --strip-components=1 `
+            "*/bin/clang.exe" "*/bin/lld.exe" "*/bin/ld.lld.exe" "*/bin/llvm-readelf.exe" "*/lib/clang/*"
+          Remove-Item $llvm
+
+      - name: Download ps5-payload-sdk
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $sdk = "ps5-payload-sdk.zip"
+          Invoke-WebRequest -Uri "https://github.com/ps5-payload-dev/sdk/releases/download/${{ env.SDK_VERSION }}/$sdk" -OutFile $sdk
+          Expand-Archive -Path $sdk -DestinationPath toolchain\ -Force
+          Remove-Item $sdk
+
+      - name: Download Go
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $go = "go${{ env.GO_VERSION }}.windows-amd64.zip"
+          Invoke-WebRequest -Uri "https://go.dev/dl/$go" -OutFile $go
+          Expand-Archive -Path $go -DestinationPath . -Force
+          Rename-Item go goroot
+          Remove-Item $go
+
+      - name: Patch and rebuild Go
+        shell: pwsh
+        run: |
+          Set-Location goroot
+          git -c core.autocrlf=false apply -p1 ..\patches\go${{ env.GO_VERSION }}-ps5.patch
+          Copy-Item bin\go.exe bin\go-bootstrap.exe
+          $env:GOTOOLCHAIN = 'local'
+          .\bin\go-bootstrap.exe install cmd/go cmd/link
+          Set-Location ..
+
+      - name: Build the payload
+        shell: pwsh
+        run: |
+          $version = '${{ inputs.version }}'
+          if ($version -eq '') { $version = '0.0.0-dev' }
+          .\tools\build-payload.ps1 -GoDir tsd -Name tailscale -Version $version -HomeIcon
+
+      - name: Run the tests
+        shell: pwsh
+        run: |
+          .\goroot\bin\go.exe test ./...
+
+      - name: Upload the payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-elf
+          path: out/tailscale.elf
